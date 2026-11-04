@@ -1,0 +1,10 @@
+{
+  "description": "Allows users to easily paste and manage code snippets for quick sharing and organization, enhancing coding productivity and collaboration.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
