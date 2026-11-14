@@ -1,24 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, ReactNode } from "react";
+import { supabaseRequest } from "./lib/supabase";
+import type { PartRow } from "./lib/supabase";
 
 /* =========================================================
    CATÁLOGO DE REPUESTOS (DESGUACE) – versión TypeScript
    Reemplaza TODO el contenido de src/App.tsx por este archivo.
 
-   CÓMO CONECTAR TU BASE DE DATOS (MySQL)
-   1. Cambia CONFIG.USE_MOCK a false.
-   2. Pon la URL de tu backend en CONFIG.API_URL.
-   3. Tu backend debe responder:
-        GET    /parts        -> lista de repuestos
-        POST   /parts        -> crea uno y devuelve el creado
-        PUT    /parts/:id    -> actualiza y devuelve el actualizado
-        DELETE /parts/:id    -> elimina
    ========================================================= */
 
 const CONFIG = {
   BUSINESS_NAME: "Mi Desguace",
-  USE_MOCK: true,
-  API_URL: "http://localhost:3000/api",
   WHATSAPP: "573000000000", // código de país + número, sin + ni espacios
 };
 
@@ -78,68 +70,71 @@ const CATEGORIES: string[] = [
 ];
 const CONDITIONS: Condition[] = ["Excelente", "Bueno", "Regular", "Para reparar"];
 
-/* ------------------------ Datos de ejemplo ------------------------ */
-const MOCK_PARTS: Part[] = [
-  { id: 1, code: "MOT-0012", name: "Motor completo 1.6L", category: "Motor", brand: "Chevrolet", model: "Aveo", yearFrom: 2012, yearTo: 2016, condition: "Bueno", price: 3800000, stock: 1, location: "Bodega A - Estante 2", donorVehicle: "Aveo 2014 (siniestro frontal)", image: "", notes: "Probado, 85.000 km." },
-  { id: 2, code: "TRN-0045", name: "Caja de cambios manual", category: "Transmisión", brand: "Renault", model: "Logan", yearFrom: 2010, yearTo: 2015, condition: "Bueno", price: 1450000, stock: 1, location: "Bodega A - Estante 4", donorVehicle: "Logan 2013", image: "", notes: "" },
-  { id: 3, code: "LUZ-0108", name: "Farola delantera derecha", category: "Luces", brand: "Mazda", model: "3", yearFrom: 2014, yearTo: 2018, condition: "Excelente", price: 320000, stock: 2, location: "Bodega B - Caja 7", donorVehicle: "Mazda 3 2016", image: "", notes: "Sin rayones ni humedad." },
-  { id: 4, code: "SUS-0077", name: "Amortiguador delantero", category: "Suspensión", brand: "Kia", model: "Picanto", yearFrom: 2012, yearTo: 2017, condition: "Regular", price: 140000, stock: 4, location: "Bodega B - Estante 1", donorVehicle: "Picanto 2015", image: "", notes: "" },
-  { id: 5, code: "CAR-0201", name: "Puerta delantera izquierda", category: "Carrocería", brand: "Toyota", model: "Corolla", yearFrom: 2009, yearTo: 2013, condition: "Bueno", price: 480000, stock: 1, location: "Patio 1", donorVehicle: "Corolla 2011", image: "", notes: "Color gris plata." },
-  { id: 6, code: "ELE-0033", name: "Alternador 90A", category: "Eléctrico", brand: "Hyundai", model: "i10", yearFrom: 2011, yearTo: 2016, condition: "Excelente", price: 260000, stock: 0, location: "Bodega B - Caja 2", donorVehicle: "i10 2013", image: "", notes: "Vendido, se espera otro." },
-  { id: 7, code: "FRE-0090", name: "Disco de freno delantero (par)", category: "Frenos", brand: "Chevrolet", model: "Spark", yearFrom: 2011, yearTo: 2017, condition: "Bueno", price: 120000, stock: 3, location: "Bodega A - Estante 6", donorVehicle: "Spark GT 2014", image: "", notes: "" },
-  { id: 8, code: "INT-0054", name: "Panel de instrumentos", category: "Interior", brand: "Nissan", model: "Versa", yearFrom: 2012, yearTo: 2019, condition: "Bueno", price: 380000, stock: 1, location: "Bodega B - Caja 5", donorVehicle: "Versa 2015", image: "", notes: "" },
-];
+/* ---------------------- Capa de datos (Supabase) ---------------------- */
+const fromDb = (row: PartRow): Part => ({
+  id: row.id,
+  code: row.code,
+  name: row.name,
+  category: row.category,
+  brand: row.brand,
+  model: row.model,
+  yearFrom: row.year_from ?? "",
+  yearTo: row.year_to ?? "",
+  condition: row.condition,
+  price: row.price,
+  stock: row.stock,
+  location: row.location,
+  donorVehicle: row.donor_vehicle,
+  image: row.image,
+  notes: row.notes,
+});
 
-/* ---------------------- Capa de datos (API) ----------------------
-   Todo el acceso a la base de datos pasa por aquí. */
-
-// Si tus columnas tienen otros nombres, ajusta estas dos funciones.
-const fromDb = (row: Part): Part => row;
-const toDb = (part: PartInput): PartInput => part;
-
-let mockDb: Part[] = [...MOCK_PARTS];
-
-function wait<T>(value: T, ms = 350): Promise<T> {
-  return new Promise((resolve) => setTimeout(() => resolve(value), ms));
-}
-
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const res = await fetch(CONFIG.API_URL + path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
-  if (!res.ok) throw new Error("Error " + res.status + " al comunicarse con el servidor");
-  return (res.status === 204 ? null : await res.json()) as T;
-}
+const toDb = (part: PartInput): Omit<PartRow, "id"> => ({
+  code: part.code,
+  name: part.name,
+  category: part.category,
+  brand: part.brand,
+  model: part.model,
+  year_from: part.yearFrom === "" ? null : part.yearFrom,
+  year_to: part.yearTo === "" ? null : part.yearTo,
+  condition: part.condition,
+  price: part.price,
+  stock: part.stock,
+  location: part.location,
+  donor_vehicle: part.donorVehicle,
+  image: part.image,
+  notes: part.notes,
+});
 
 const api = {
   async list(): Promise<Part[]> {
-    if (CONFIG.USE_MOCK) return wait([...mockDb]);
-    const rows = await request<Part[]>("/parts");
+    const rows = await supabaseRequest<PartRow[]>("parts?select=*&order=id.desc");
+    if (!rows) throw new Error("Supabase no devolvió el inventario.");
     return rows.map(fromDb);
   },
   async create(part: PartInput): Promise<Part> {
-    if (CONFIG.USE_MOCK) {
-      const created: Part = { ...part, id: Date.now() };
-      mockDb = [created, ...mockDb];
-      return wait(created);
-    }
-    return fromDb(await request<Part>("/parts", { method: "POST", body: JSON.stringify(toDb(part)) }));
+    const rows = await supabaseRequest<PartRow[]>("parts?select=*", {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify(toDb(part)),
+    });
+    if (!rows?.[0]) throw new Error("Supabase no devolvió el repuesto creado.");
+    return fromDb(rows[0]);
   },
   async update(part: Part): Promise<Part> {
-    if (CONFIG.USE_MOCK) {
-      mockDb = mockDb.map((p) => (p.id === part.id ? part : p));
-      return wait(part);
-    }
-    return fromDb(await request<Part>("/parts/" + part.id, { method: "PUT", body: JSON.stringify(toDb(part)) }));
+    const rows = await supabaseRequest<PartRow[]>(
+      `parts?id=eq.${part.id}&select=*`,
+      {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify(toDb(part)),
+      },
+    );
+    if (!rows?.[0]) throw new Error("Supabase no encontró el repuesto que intentaste editar.");
+    return fromDb(rows[0]);
   },
   async remove(id: number): Promise<void> {
-    if (CONFIG.USE_MOCK) {
-      mockDb = mockDb.filter((p) => p.id !== id);
-      await wait(null);
-      return;
-    }
-    await request<null>("/parts/" + id, { method: "DELETE" });
+    await supabaseRequest<null>(`parts?id=eq.${id}`, { method: "DELETE" });
   },
 };
 
@@ -518,7 +513,7 @@ export default function App() {
           </div>
           <label className="dz-switch">
             <input type="checkbox" checked={admin} onChange={(e) => setAdmin(e.target.checked)} />
-            <span>Modo administrador</span>
+            <span>Modo edición (público)</span>
           </label>
         </div>
       </header>
