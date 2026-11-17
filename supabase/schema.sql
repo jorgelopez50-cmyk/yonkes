@@ -17,6 +17,9 @@ create table if not exists public.parts (
   notes text not null default ''
 );
 
+alter table public.parts
+  add column if not exists owner_id uuid default auth.uid() references auth.users(id) on delete cascade;
+
 alter table public.parts enable row level security;
 
 grant select, insert, update, delete on public.parts to anon, authenticated;
@@ -27,21 +30,21 @@ create policy "Public can read parts"
   to anon, authenticated
   using (true);
 
-drop policy if exists "Public can add parts" on public.parts;
-create policy "Public can add parts"
+drop policy if exists "Authenticated users can add parts" on public.parts;
+create policy "Authenticated users can add parts"
   on public.parts for insert
-  to anon, authenticated
-  with check (true);
+  to authenticated
+  with check (auth.uid() = owner_id);
 
-drop policy if exists "Public can edit parts" on public.parts;
-create policy "Public can edit parts"
+drop policy if exists "Owners can edit parts" on public.parts;
+create policy "Owners can edit parts"
   on public.parts for update
-  to anon, authenticated
-  using (true)
-  with check (true);
+  to authenticated
+  using (auth.uid() = owner_id)
+  with check (auth.uid() = owner_id);
 
-drop policy if exists "Public can delete parts" on public.parts;
-create policy "Public can delete parts"
+drop policy if exists "Owners can delete parts" on public.parts;
+create policy "Owners can delete parts"
   on public.parts for delete
-  to anon, authenticated
-  using (true);
+  to authenticated
+  using (auth.uid() = owner_id);

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, ReactNode } from "react";
-import { supabaseRequest } from "./lib/supabase";
+import { auth, supabaseRequest } from "./lib/supabase";
 import type { PartRow } from "./lib/supabase";
+import type { AuthSession } from "./lib/supabase";
 
 /* =========================================================
    CATÁLOGO DE REPUESTOS (DESGUACE) – versión TypeScript
@@ -10,7 +11,7 @@ import type { PartRow } from "./lib/supabase";
    ========================================================= */
 
 const CONFIG = {
-  BUSINESS_NAME: "Mi Desguace",
+  BUSINESS_NAME: "AutoPartes LIN",
   WHATSAPP: "573000000000", // código de país + número, sin + ni espacios
 };
 
@@ -310,7 +311,7 @@ function PartForm({ initial, onClose, onSave }: PartFormProps) {
               {CONDITIONS.map((c) => <option key={c}>{c}</option>)}
             </select>
           </label>
-          <label>Precio (COP) *
+          <label>Precio (MXN) *
             <input type="number" min="0" value={form.price} onChange={set("price")} />
           </label>
           <label>Cantidad en stock
@@ -454,6 +455,128 @@ function PartsTable({ parts, admin, onEdit, onDelete }: TableProps) {
   );
 }
 
+type LoginModalProps = {
+  onClose: () => void;
+  onSignedIn: (session: AuthSession) => void;
+  initialMode: "login" | "signup";
+};
+
+function LoginModal({ onClose, onSignedIn, initialMode }: LoginModalProps) {
+  const [mode, setMode] = useState<"login" | "signup">(initialMode);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const submit = async () => {
+    if (!email.trim() || !password) {
+      setError("Ingresa tu correo y contraseña.");
+      return;
+    }
+    if (mode === "signup" && password.length < 6) {
+      setError("La contraseña debe tener al menos 6 caracteres.");
+      return;
+    }
+    if (mode === "signup" && password !== confirmPassword) {
+      setError("Las contraseñas no coinciden.");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    setNotice("");
+    try {
+      if (mode === "signup") {
+        const session = await auth.signUp(email.trim(), password);
+        if (session) {
+          onSignedIn(session);
+          onClose();
+        } else {
+          setNotice("Cuenta creada. Revisa tu correo y confirma la dirección antes de iniciar sesión.");
+        }
+      } else {
+        onSignedIn(await auth.signIn(email.trim(), password));
+        onClose();
+      }
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="dz-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="dz-modal dz-login-modal" role="dialog" aria-modal="true" aria-label="Iniciar sesión">
+        <h2>{mode === "signup" ? "Crear cuenta" : "Acceso de administrador"}</h2>
+        <p className="dz-login-help">
+          {mode === "signup"
+            ? "Regístrate para publicar y administrar repuestos."
+            : "Inicia sesión para publicar, editar o eliminar repuestos."}
+        </p>
+        <div className="dz-login-form">
+          <label>
+            Correo electrónico
+            <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" />
+          </label>
+          <label>
+            Contraseña
+            <input
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              autoComplete="current-password"
+              onKeyDown={(event) => event.key === "Enter" && void submit()}
+            />
+          </label>
+          {mode === "signup" && (
+            <label>
+              Confirmar contraseña
+              <input
+                type="password"
+                value={confirmPassword}
+                onChange={(event) => setConfirmPassword(event.target.value)}
+                autoComplete="new-password"
+                onKeyDown={(event) => event.key === "Enter" && void submit()}
+              />
+            </label>
+          )}
+        </div>
+        {error && <p className="dz-form-error" role="alert">{error}</p>}
+        {notice && <p className="dz-form-notice" role="status">{notice}</p>}
+        <button
+          className="dz-auth-mode"
+          type="button"
+          onClick={() => {
+            setMode(mode === "signup" ? "login" : "signup");
+            setError("");
+            setNotice("");
+          }}
+        >
+          {mode === "signup" ? "Ya tengo una cuenta" : "Crear una cuenta nueva"}
+        </button>
+        <div className="dz-modal-actions">
+          <button className="dz-btn dz-btn-ghost" onClick={onClose} disabled={saving}>Cancelar</button>
+          <button className="dz-btn dz-btn-primary" onClick={() => void submit()} disabled={saving}>
+            {saving
+              ? (mode === "signup" ? "Creando cuenta..." : "Ingresando...")
+              : (mode === "signup" ? "Crear cuenta" : "Iniciar sesión")}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ------------------------------- App ------------------------------- */
 export default function App() {
   const { parts, loading, error, reload, save, remove } = useParts();
@@ -464,8 +587,23 @@ export default function App() {
   const [condition, setCondition] = useState<string>("Todos");
   const [onlyAvailable, setOnlyAvailable] = useState<boolean>(false);
   const [view, setView] = useState<"cards" | "table">("cards");
-  const [admin, setAdmin] = useState<boolean>(false); // En producción, actívalo con un inicio de sesión real
+  const [session, setSession] = useState<AuthSession | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [authMode, setAuthMode] = useState<"login" | "signup">("login");
   const [editing, setEditing] = useState<Part | "new" | null>(null);
+  const admin = session !== null;
+
+  useEffect(() => {
+    void auth.getSession()
+      .then(setSession)
+      .finally(() => setAuthLoading(false));
+  }, []);
+
+  const signOut = async () => {
+    await auth.signOut();
+    setSession(null);
+  };
 
   const brands = useMemo<string[]>(
     () => ["Todas", ...Array.from(new Set(parts.map((p) => p.brand).filter(Boolean))).sort()],
@@ -511,10 +649,17 @@ export default function App() {
               <small>Repuestos usados para carros</small>
             </div>
           </div>
-          <label className="dz-switch">
-            <input type="checkbox" checked={admin} onChange={(e) => setAdmin(e.target.checked)} />
-            <span>Modo edición (público)</span>
-          </label>
+          {authLoading ? null : admin ? (
+            <div className="dz-auth-actions">
+              <span className="dz-user">{session.user.email || "Administrador"}</span>
+              <button className="dz-login-button" onClick={() => void signOut()}>Cerrar sesión</button>
+            </div>
+          ) : (
+            <div className="dz-auth-actions">
+              <button className="dz-login-button dz-signup-button" onClick={() => { setAuthMode("signup"); setLoginOpen(true); }}>Crear cuenta</button>
+              <button className="dz-login-button" onClick={() => { setAuthMode("login"); setLoginOpen(true); }}>Iniciar sesión</button>
+            </div>
+          )}
         </div>
       </header>
 
@@ -599,6 +744,14 @@ export default function App() {
           onSave={save}
         />
       )}
+
+      {loginOpen && (
+        <LoginModal
+          onClose={() => setLoginOpen(false)}
+          onSignedIn={setSession}
+          initialMode={authMode}
+        />
+      )}
     </div>
   );
 }
@@ -626,7 +779,18 @@ const css = `
 .dz-brand strong { display: block; font-size: 18px; letter-spacing: .2px; }
 .dz-brand small { display: block; font-size: 12px; color: #b9bdc2; }
 .dz-logo { width: 38px; height: 38px; border-radius: 8px; background: #3d444c; display: grid; place-items: center; }
-.dz-switch { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #d8dadd; cursor: pointer; }
+.dz-auth-actions { display: flex; align-items: center; gap: 12px; }
+.dz-user { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: #d8dadd; }
+.dz-login-button { min-height: 38px; border: 1px solid #69717a; border-radius: 8px; background: #38404a; color: #fff; padding: 0 12px; font-weight: 600; }
+.dz-login-button:hover { background: #46505b; }
+.dz-login-modal { max-width: 420px; }
+.dz-login-help { margin: -8px 0 16px; color: var(--muted); font-size: 14px; }
+.dz-login-form { display: grid; gap: 12px; }
+.dz-login-form label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; font-weight: 600; }
+.dz-login-form input { border: 1px solid #c9c6bf; border-radius: 8px; padding: 10px; font-weight: 400; }
+.dz-signup-button { background: transparent; border-color: #b1b7bd; }
+.dz-auth-mode { border: 0; background: transparent; color: var(--steel); padding: 10px 0 0; font-weight: 600; }
+.dz-form-notice { color: var(--ok); margin: 12px 0 0; font-size: 14px; }
 
 /* Intro */
 .dz-main { padding-top: 28px; padding-bottom: 56px; }
