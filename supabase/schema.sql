@@ -92,7 +92,7 @@ drop policy if exists "Authenticated users can add parts" on public.parts;
 create policy "Authenticated users can add parts"
   on public.parts for insert
   to authenticated
-  with check (public.is_admin() and auth.uid() = owner_id);
+  with check (auth.uid() = owner_id);
 
 drop policy if exists "Owners can edit parts" on public.parts;
 create policy "Owners can edit parts"

@@ -721,7 +721,7 @@ export default function App() {
             <h1>Encuentra el repuesto que necesitas</h1>
             <p>Busca por pieza, marca, modelo o código. Todos los repuestos salen de vehículos desarmados en nuestro patio.</p>
           </div>
-          {admin && (
+          {session && (
             <button className="dz-btn dz-btn-primary" onClick={() => setEditing("new")}>
               <PlusIcon /> Agregar repuesto
             </button>
