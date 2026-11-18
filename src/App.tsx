@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, ReactNode } from "react";
 import { auth, supabaseRequest } from "./lib/supabase";
-import type { PartRow } from "./lib/supabase";
-import type { AuthSession } from "./lib/supabase";
+import type { AuthRole, AuthSession, PartRow } from "./lib/supabase";
 
 /* =========================================================
    CATÁLOGO DE REPUESTOS (DESGUACE) – versión TypeScript
@@ -14,6 +13,25 @@ const CONFIG = {
   BUSINESS_NAME: "AutoPartes LIN",
   WHATSAPP: "573000000000", // código de país + número, sin + ni espacios
 };
+
+// Edita esta lista en el código para agregar o quitar palabras y frases.
+const CENSORED_WORDS = [
+  "puta",
+  "puto",
+  "mierda",
+  "pendejo",
+  "pendeja",
+  "verga",
+  "cabron",
+  "cabrón",
+  "cabrona",
+  "gonorrea",
+  "malparido",
+  "malparida",
+  "joder",
+  "coño",
+  "carajo",
+];
 
 /* ------------------------------ Tipos ------------------------------ */
 type Condition = "Excelente" | "Bueno" | "Regular" | "Para reparar";
@@ -141,6 +159,20 @@ const api = {
 
 /* --------------------------- Utilidades --------------------------- */
 const formatPrice = (n: number): string => "$" + Number(n || 0).toLocaleString("es-CO");
+
+function censorText(value: string, words: readonly string[]): string {
+  return words.reduce((text, word) => {
+    const escaped = word.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (!escaped) return text;
+    const pattern = new RegExp(
+      `(^|[^\\p{L}\\p{N}\\p{M}_])(${escaped})(?=$|[^\\p{L}\\p{N}\\p{M}_])`,
+      "giu",
+    );
+    return text.replace(pattern, (_match, prefix: string, found: string) =>
+      prefix + found.replace(/[\p{L}\p{N}]/gu, "*"),
+    );
+  }, value);
+}
 
 const years = (p: Part): string | number =>
   p.yearFrom && p.yearTo && p.yearFrom !== p.yearTo
@@ -351,17 +383,17 @@ function stockInfo(p: Part): { label: string; cls: string } {
   return { label: p.stock + " disponibles", cls: "is-ok" };
 }
 
-function whatsappLink(p: Part): string {
+function whatsappLink(p: Part, words: readonly string[]): string {
   const text =
-    "Hola, me interesa este repuesto: " + p.name + " (" + (p.code || "sin código") + ") " +
-    [p.brand, p.model, years(p)].filter(Boolean).join(" ") + ". ¿Sigue disponible?";
+    "Hola, me interesa este repuesto: " + censorText(p.name, words) + " (" + censorText(p.code || "sin código", words) + ") " +
+    [p.brand, p.model, years(p)].filter(Boolean).map((value) => censorText(String(value), words)).join(" ") + ". ¿Sigue disponible?";
   return "https://wa.me/" + CONFIG.WHATSAPP + "?text=" + encodeURIComponent(text);
 }
 
-function PartImage({ part }: { part: Part }) {
+function PartImage({ part, censoredWords }: { part: Part; censoredWords: readonly string[] }) {
   const [failed, setFailed] = useState<boolean>(false);
   if (part.image && !failed) {
-    return <img src={part.image} alt={part.name} loading="lazy" onError={() => setFailed(true)} />;
+    return <img src={part.image} alt={censorText(part.name, censoredWords)} loading="lazy" onError={() => setFailed(true)} />;
   }
   return <div className="dz-noimg"><WrenchIcon size={40} /><span>Sin foto</span></div>;
 }
@@ -369,23 +401,24 @@ function PartImage({ part }: { part: Part }) {
 type CardProps = {
   part: Part;
   admin: boolean;
+  censoredWords: readonly string[];
   onEdit: (part: Part) => void;
   onDelete: (part: Part) => void;
 };
 
-function PartCard({ part, admin, onEdit, onDelete }: CardProps) {
+function PartCard({ part, admin, censoredWords, onEdit, onDelete }: CardProps) {
   const s = stockInfo(part);
   return (
     <article className="dz-card">
       <div className="dz-card-media">
-        <PartImage part={part} />
+        <PartImage part={part} censoredWords={censoredWords} />
         <span className={"dz-stock " + s.cls}>{s.label}</span>
       </div>
       <div className="dz-card-body">
-        <p className="dz-code">{part.code || "Sin código"} · {part.category}</p>
-        <h3>{part.name}</h3>
-        <p className="dz-fit"><CarIcon />{[part.brand, part.model, years(part)].filter(Boolean).join(" ") || "Compatibilidad sin especificar"}</p>
-        {part.location && <p className="dz-loc"><PinIcon />{part.location}</p>}
+        <p className="dz-code">{censorText(part.code || "Sin código", censoredWords)} · {censorText(part.category, censoredWords)}</p>
+        <h3>{censorText(part.name, censoredWords)}</h3>
+        <p className="dz-fit"><CarIcon />{[part.brand, part.model, years(part)].filter(Boolean).map((value) => censorText(String(value), censoredWords)).join(" ") || "Compatibilidad sin especificar"}</p>
+        {part.location && <p className="dz-loc"><PinIcon />{censorText(part.location, censoredWords)}</p>}
 
         <div className="dz-card-row">
           <span className="dz-price">{formatPrice(part.price)}</span>
@@ -400,7 +433,7 @@ function PartCard({ part, admin, onEdit, onDelete }: CardProps) {
         ) : (
           <a
             className={"dz-btn dz-btn-primary dz-block" + (part.stock <= 0 ? " is-disabled" : "")}
-            href={part.stock <= 0 ? undefined : whatsappLink(part)}
+            href={part.stock <= 0 ? undefined : whatsappLink(part, censoredWords)}
             target="_blank"
             rel="noreferrer"
           >
@@ -416,11 +449,12 @@ function PartCard({ part, admin, onEdit, onDelete }: CardProps) {
 type TableProps = {
   parts: Part[];
   admin: boolean;
+  censoredWords: readonly string[];
   onEdit: (part: Part) => void;
   onDelete: (part: Part) => void;
 };
 
-function PartsTable({ parts, admin, onEdit, onDelete }: TableProps) {
+function PartsTable({ parts, admin, censoredWords, onEdit, onDelete }: TableProps) {
   return (
     <div className="dz-table-wrap">
       <table className="dz-table">
@@ -434,12 +468,12 @@ function PartsTable({ parts, admin, onEdit, onDelete }: TableProps) {
         <tbody>
           {parts.map((p) => (
             <tr key={p.id}>
-              <td>{p.code}</td>
-              <td><strong>{p.name}</strong><br /><small>{p.category}</small></td>
-              <td>{[p.brand, p.model, years(p)].filter(Boolean).join(" ")}</td>
+              <td>{censorText(p.code, censoredWords)}</td>
+              <td><strong>{censorText(p.name, censoredWords)}</strong><br /><small>{censorText(p.category, censoredWords)}</small></td>
+              <td>{[p.brand, p.model, years(p)].filter(Boolean).map((value) => censorText(String(value), censoredWords)).join(" ")}</td>
               <td>{p.condition}</td>
               <td>{p.stock}</td>
-              <td>{p.location}</td>
+              <td>{censorText(p.location, censoredWords)}</td>
               <td className="num">{formatPrice(p.price)}</td>
               {admin && (
                 <td className="dz-row-actions">
@@ -459,9 +493,10 @@ type LoginModalProps = {
   onClose: () => void;
   onSignedIn: (session: AuthSession) => void;
   initialMode: "login" | "signup";
+  role: AuthRole;
 };
 
-function LoginModal({ onClose, onSignedIn, initialMode }: LoginModalProps) {
+function LoginModal({ onClose, onSignedIn, initialMode, role }: LoginModalProps) {
   const [mode, setMode] = useState<"login" | "signup">(initialMode);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -504,7 +539,7 @@ function LoginModal({ onClose, onSignedIn, initialMode }: LoginModalProps) {
           setNotice("Cuenta creada. Revisa tu correo y confirma la dirección antes de iniciar sesión.");
         }
       } else {
-        onSignedIn(await auth.signIn(email.trim(), password));
+        onSignedIn(await auth.signIn(email.trim(), password, role));
         onClose();
       }
     } catch (e) {
@@ -516,12 +551,14 @@ function LoginModal({ onClose, onSignedIn, initialMode }: LoginModalProps) {
 
   return (
     <div className="dz-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="dz-modal dz-login-modal" role="dialog" aria-modal="true" aria-label="Iniciar sesión">
-        <h2>{mode === "signup" ? "Crear cuenta" : "Acceso de administrador"}</h2>
+      <div className="dz-modal dz-login-modal" role="dialog" aria-modal="true" aria-label={mode === "signup" ? "Crear cuenta de usuario" : `Acceso de ${role === "admin" ? "administrador" : "usuario"}`}>
+        <h2>{mode === "signup" ? "Crear cuenta de usuario" : `Acceso de ${role === "admin" ? "administrador" : "usuario"}`}</h2>
         <p className="dz-login-help">
           {mode === "signup"
-            ? "Regístrate para publicar y administrar repuestos."
-            : "Inicia sesión para publicar, editar o eliminar repuestos."}
+            ? "Regístrate para iniciar sesión como usuario."
+            : role === "admin"
+              ? "Este acceso es exclusivo para cuentas autorizadas como administrador."
+              : "Inicia sesión con tu cuenta de usuario."}
         </p>
         <div className="dz-login-form">
           <label>
@@ -553,17 +590,19 @@ function LoginModal({ onClose, onSignedIn, initialMode }: LoginModalProps) {
         </div>
         {error && <p className="dz-form-error" role="alert">{error}</p>}
         {notice && <p className="dz-form-notice" role="status">{notice}</p>}
-        <button
-          className="dz-auth-mode"
-          type="button"
-          onClick={() => {
-            setMode(mode === "signup" ? "login" : "signup");
-            setError("");
-            setNotice("");
-          }}
-        >
-          {mode === "signup" ? "Ya tengo una cuenta" : "Crear una cuenta nueva"}
-        </button>
+        {role === "user" && (
+          <button
+            className="dz-auth-mode"
+            type="button"
+            onClick={() => {
+              setMode(mode === "signup" ? "login" : "signup");
+              setError("");
+              setNotice("");
+            }}
+          >
+            {mode === "signup" ? "Ya tengo una cuenta" : "Crear una cuenta nueva"}
+          </button>
+        )}
         <div className="dz-modal-actions">
           <button className="dz-btn dz-btn-ghost" onClick={onClose} disabled={saving}>Cancelar</button>
           <button className="dz-btn dz-btn-primary" onClick={() => void submit()} disabled={saving}>
@@ -589,20 +628,29 @@ export default function App() {
   const [view, setView] = useState<"cards" | "table">("cards");
   const [session, setSession] = useState<AuthSession | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState("");
   const [loginOpen, setLoginOpen] = useState(false);
   const [authMode, setAuthMode] = useState<"login" | "signup">("login");
+  const [authRole, setAuthRole] = useState<AuthRole>("user");
   const [editing, setEditing] = useState<Part | "new" | null>(null);
-  const admin = session !== null;
+  const admin = session?.user.accountRole === "admin";
 
   useEffect(() => {
     void auth.getSession()
       .then(setSession)
+      .catch((e: unknown) => setAuthError(errorMessage(e)))
       .finally(() => setAuthLoading(false));
   }, []);
 
   const signOut = async () => {
     await auth.signOut();
     setSession(null);
+    setAuthError("");
+  };
+
+  const handleSignedIn = (nextSession: AuthSession) => {
+    setSession(nextSession);
+    setAuthError("");
   };
 
   const brands = useMemo<string[]>(
@@ -624,7 +672,7 @@ export default function App() {
   }, [parts, query, category, brand, condition, onlyAvailable]);
 
   const handleDelete = async (p: Part) => {
-    if (!window.confirm('¿Eliminar "' + p.name + '"? Esta acción no se puede deshacer.')) return;
+    if (!window.confirm('¿Eliminar "' + censorText(p.name, CENSORED_WORDS) + '"? Esta acción no se puede deshacer.')) return;
     try {
       await remove(p.id);
     } catch (e) {
@@ -649,21 +697,25 @@ export default function App() {
               <small>Repuestos usados para carros</small>
             </div>
           </div>
-          {authLoading ? null : admin ? (
+          {authLoading ? null : session ? (
             <div className="dz-auth-actions">
-              <span className="dz-user">{session.user.email || "Administrador"}</span>
+              <span className="dz-user">
+                {session.user.email || (admin ? "Administrador" : "Usuario")} · {admin ? "Administrador" : "Usuario"}
+              </span>
               <button className="dz-login-button" onClick={() => void signOut()}>Cerrar sesión</button>
             </div>
           ) : (
             <div className="dz-auth-actions">
-              <button className="dz-login-button dz-signup-button" onClick={() => { setAuthMode("signup"); setLoginOpen(true); }}>Crear cuenta</button>
-              <button className="dz-login-button" onClick={() => { setAuthMode("login"); setLoginOpen(true); }}>Iniciar sesión</button>
+              <button className="dz-login-button" onClick={() => { setAuthRole("admin"); setAuthMode("login"); setLoginOpen(true); }}>Acceso administrador</button>
+              <button className="dz-login-button" onClick={() => { setAuthRole("user"); setAuthMode("login"); setLoginOpen(true); }}>Acceso usuario</button>
+              <button className="dz-login-button dz-signup-button" onClick={() => { setAuthRole("user"); setAuthMode("signup"); setLoginOpen(true); }}>Crear cuenta</button>
             </div>
           )}
         </div>
       </header>
 
       <main className="dz-container dz-main">
+        {authError && <div className="dz-alert" role="alert">No pudimos verificar tu sesión. {authError}</div>}
         <section className="dz-intro">
           <div>
             <h1>Encuentra el repuesto que necesitas</h1>
@@ -726,15 +778,17 @@ export default function App() {
           </div>
         )}
 
-        {!loading && filtered.length > 0 && (view === "cards" ? (
-          <section className="dz-grid">
-            {filtered.map((p) => (
-              <PartCard key={p.id} part={p} admin={admin} onEdit={setEditing} onDelete={(part) => void handleDelete(part)} />
-            ))}
-          </section>
-        ) : (
-          <PartsTable parts={filtered} admin={admin} onEdit={setEditing} onDelete={(part) => void handleDelete(part)} />
-        ))}
+        {!loading && !error && filtered.length > 0 && (
+          view === "cards" ? (
+            <section className="dz-grid">
+              {filtered.map((p) => (
+                <PartCard key={p.id} part={p} admin={admin} censoredWords={CENSORED_WORDS} onEdit={setEditing} onDelete={(part) => void handleDelete(part)} />
+              ))}
+            </section>
+          ) : (
+            <PartsTable parts={filtered} admin={admin} censoredWords={CENSORED_WORDS} onEdit={setEditing} onDelete={(part) => void handleDelete(part)} />
+          )
+        )}
       </main>
 
       {editing && (
@@ -748,8 +802,9 @@ export default function App() {
       {loginOpen && (
         <LoginModal
           onClose={() => setLoginOpen(false)}
-          onSignedIn={setSession}
+          onSignedIn={handleSignedIn}
           initialMode={authMode}
+          role={authRole}
         />
       )}
     </div>
@@ -832,6 +887,7 @@ const css = `
 .dz-grid { display: grid; gap: 18px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
 @media (max-width: 1024px) { .dz-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 760px)  { .dz-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .dz-intro h1 { font-size: 24px; } }
+@media (max-width: 600px)  { .dz-header-inner { height: auto; min-height: 64px; flex-wrap: wrap; padding-top: 10px; padding-bottom: 10px; } .dz-auth-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; gap: 8px; } }
 @media (max-width: 480px)  { .dz-grid { grid-template-columns: 1fr; } .dz-view { margin-left: 0; } }
 
 .dz-card { display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }

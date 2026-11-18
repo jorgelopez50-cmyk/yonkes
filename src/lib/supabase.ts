@@ -19,7 +19,10 @@ export type PartRow = {
 export type AuthUser = {
   id: string;
   email?: string;
+  accountRole?: AuthRole;
 };
+
+export type AuthRole = "admin" | "user";
 
 export type AuthSession = {
   access_token: string;
@@ -58,6 +61,21 @@ function getSupabaseConfig() {
   }
 
   return { url: url.replace(/\/$/, ""), anonKey };
+}
+
+async function loadProfile(session: AuthSession): Promise<AuthSession> {
+  const user = await authRequest<AuthUser>("/auth/v1/user", {
+    headers: { Authorization: `Bearer ${session.access_token}` },
+  });
+  const profiles = await authRequest<Array<{ role: AuthRole }>>(
+    `/rest/v1/profiles?id=eq.${encodeURIComponent(user.id)}&select=role`,
+    { headers: { Authorization: `Bearer ${session.access_token}` } },
+  );
+  const role = profiles?.[0]?.role;
+  if (role !== "admin" && role !== "user") {
+    throw new Error("No se encontró un rol válido para esta cuenta. Verifica la configuración de perfiles en Supabase.");
+  }
+  return { ...session, user: { ...user, accountRole: role } };
 }
 
 export async function supabaseRequest<T>(
@@ -123,20 +141,18 @@ export const auth = {
       },
     );
 
-    if ("session" in result && result.session) {
-      storeSession(result.session);
-      return result.session;
+    const session = "access_token" in result ? result : result.session;
+    if (!session) return null;
+    const authenticated = await loadProfile(session);
+    if (authenticated.user.accountRole !== "user") {
+      storeSession(null);
+      throw new Error("Las cuentas nuevas solo pueden registrarse como usuario.");
     }
-
-    if ("access_token" in result && result.access_token) {
-      storeSession(result);
-      return result;
-    }
-
-    return null;
+    storeSession(authenticated);
+    return authenticated;
   },
 
-  async signIn(email: string, password: string): Promise<AuthSession> {
+  async signIn(email: string, password: string, expectedRole: AuthRole): Promise<AuthSession> {
     const session = await authRequest<AuthSession>(
       "/auth/v1/token?grant_type=password",
       {
@@ -144,8 +160,21 @@ export const auth = {
         body: JSON.stringify({ email, password }),
       },
     );
-    storeSession(session);
-    return session;
+    try {
+      const authenticated = await loadProfile(session);
+      if (authenticated.user.accountRole !== expectedRole) {
+        throw new Error(
+          expectedRole === "admin"
+            ? "Esta cuenta no tiene acceso de administrador."
+            : "Esta cuenta es de administrador. Usa el acceso de administrador.",
+        );
+      }
+      storeSession(authenticated);
+      return authenticated;
+    } catch (error) {
+      storeSession(null);
+      throw error;
+    }
   },
 
   async getSession(): Promise<AuthSession | null> {
@@ -153,13 +182,12 @@ export const auth = {
     if (!session) return null;
 
     try {
-      const user = await authRequest<AuthUser>("/auth/v1/user", {
-        headers: { Authorization: `Bearer ${session.access_token}` },
-      });
-      return { ...session, user };
-    } catch {
+      const authenticated = await loadProfile(session);
+      storeSession(authenticated);
+      return authenticated;
+    } catch (error) {
       storeSession(null);
-      return null;
+      throw error;
     }
   },
 
