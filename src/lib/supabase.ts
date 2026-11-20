@@ -1,5 +1,6 @@
 export type PartRow = {
   id: number;
+  owner_id: string | null;
   code: string;
   name: string;
   category: string;
@@ -19,10 +20,17 @@ export type PartRow = {
 export type AuthUser = {
   id: string;
   email?: string;
+  phone?: string | null;
   accountRole?: AuthRole;
 };
 
 export type AuthRole = "admin" | "user";
+
+export type ManagedUser = {
+  id: string;
+  email: string | null;
+  role: AuthRole;
+};
 
 export type AuthSession = {
   access_token: string;
@@ -32,6 +40,13 @@ export type AuthSession = {
 };
 
 const AUTH_STORAGE_KEY = "yonkes_supabase_auth";
+const PART_IMAGES_BUCKET = "part-images";
+const MAX_PART_IMAGE_SIZE = 5 * 1024 * 1024;
+const PART_IMAGE_EXTENSIONS: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+};
 
 function readStoredSession(): AuthSession | null {
   try {
@@ -63,19 +78,85 @@ function getSupabaseConfig() {
   return { url: url.replace(/\/$/, ""), anonKey };
 }
 
+function getStorageErrorMessage(body: string, status: number): string {
+  let message = body || `HTTP ${status}`;
+  try {
+    const error = JSON.parse(body) as { message?: string; error?: string };
+    message = error.message || error.error || message;
+  } catch {
+    // Keep the response text when Supabase doesn't return JSON.
+  }
+  if (/bucket not found/i.test(message)) {
+    return `No existe el bucket "${PART_IMAGES_BUCKET}". En el mismo proyecto de Supabase que usa la app, ejecuta el bloque de Storage de supabase/schema.sql. Si ya lo ejecutaste, verifica que VITE_SUPABASE_URL apunte a ese proyecto.`;
+  }
+  return `Supabase Storage: ${message}`;
+}
+
+export async function uploadPartImage(file: File): Promise<{ url: string; path: string }> {
+  const extension = PART_IMAGE_EXTENSIONS[file.type];
+  if (!extension) throw new Error("Elige una imagen JPG, PNG o WebP.");
+  if (file.size > MAX_PART_IMAGE_SIZE) throw new Error("La foto no puede pesar más de 5 MB.");
+
+  const session = readStoredSession();
+  if (!session) throw new Error("Inicia sesión para subir fotos de repuestos.");
+
+  const { url, anonKey } = getSupabaseConfig();
+  const path = `${session.user.id}/${crypto.randomUUID()}.${extension}`;
+  const response = await fetch(
+    `${url}/storage/v1/object/${PART_IMAGES_BUCKET}/${path}`,
+    {
+      method: "POST",
+      headers: {
+        apikey: anonKey,
+        Authorization: `Bearer ${session.access_token}`,
+        "Content-Type": file.type,
+        "x-upsert": "false",
+      },
+      body: file,
+    },
+  );
+  if (!response.ok) {
+    throw new Error(getStorageErrorMessage(await response.text(), response.status));
+  }
+  return {
+    url: `${url}/storage/v1/object/public/${PART_IMAGES_BUCKET}/${path}`,
+    path,
+  };
+}
+
+export async function removePartImage(path: string): Promise<void> {
+  const session = readStoredSession();
+  if (!session) throw new Error("Inicia sesión para administrar las fotos de repuestos.");
+
+  const { url, anonKey } = getSupabaseConfig();
+  const response = await fetch(`${url}/storage/v1/object/${PART_IMAGES_BUCKET}`, {
+    method: "DELETE",
+    headers: {
+      apikey: anonKey,
+      Authorization: `Bearer ${session.access_token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ prefixes: [path] }),
+  });
+  if (!response.ok) {
+    throw new Error(getStorageErrorMessage(await response.text(), response.status));
+  }
+}
+
 async function loadProfile(session: AuthSession): Promise<AuthSession> {
   const user = await authRequest<AuthUser>("/auth/v1/user", {
     headers: { Authorization: `Bearer ${session.access_token}` },
   });
-  const profiles = await authRequest<Array<{ role: AuthRole }>>(
-    `/rest/v1/profiles?id=eq.${encodeURIComponent(user.id)}&select=role`,
+  const profiles = await authRequest<Array<{ role: AuthRole; phone: string | null }>>(
+    `/rest/v1/profiles?id=eq.${encodeURIComponent(user.id)}&select=role,phone`,
     { headers: { Authorization: `Bearer ${session.access_token}` } },
   );
-  const role = profiles?.[0]?.role;
+  const profile = profiles?.[0];
+  const role = profile?.role;
   if (role !== "admin" && role !== "user") {
     throw new Error("No se encontró un rol válido para esta cuenta. Verifica la configuración de perfiles en Supabase.");
   }
-  return { ...session, user: { ...user, accountRole: role } };
+  return { ...session, user: { ...user, phone: profile?.phone, accountRole: role } };
 }
 
 export async function supabaseRequest<T>(
@@ -108,6 +189,32 @@ export async function supabaseRequest<T>(
   return JSON.parse(body) as T;
 }
 
+export async function listManagedUsers(): Promise<ManagedUser[]> {
+  const rows = await supabaseRequest<ManagedUser[]>(
+    "profiles?select=id,email,role&order=email.asc",
+  );
+  if (!rows) throw new Error("Supabase no devolvió la lista de usuarios.");
+  return rows;
+}
+
+export async function updateManagedUserRole(
+  userId: string,
+  role: AuthRole,
+): Promise<ManagedUser> {
+  const rows = await supabaseRequest<ManagedUser[]>(
+    `profiles?id=eq.${encodeURIComponent(userId)}&select=id,email,role`,
+    {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ role }),
+    },
+  );
+  if (!rows?.[0]) {
+    throw new Error("Supabase no encontró al usuario o no tienes permiso para cambiar su rol.");
+  }
+  return rows[0];
+}
+
 async function authRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
   const { url, anonKey } = getSupabaseConfig();
   const headers = new Headers(options.headers);
@@ -132,12 +239,64 @@ async function authRequest<T>(path: string, options: RequestInit = {}): Promise<
 }
 
 export const auth = {
-  async signUp(email: string, password: string): Promise<AuthSession | null> {
+  async confirmSignup(
+    accessToken: string,
+    refreshToken: string,
+    expiresAt: number,
+  ): Promise<AuthSession> {
+    if (!accessToken || !refreshToken) {
+      throw new Error("El enlace de confirmación está incompleto. Solicita uno nuevo.");
+    }
+    const authenticated = await loadProfile({
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      expires_at: expiresAt || undefined,
+      user: { id: "" },
+    });
+    storeSession(authenticated);
+    return authenticated;
+  },
+
+  async recoverPassword(email: string): Promise<void> {
+    const redirectTo = `${window.location.origin}${window.location.pathname}`;
+    await authRequest("/auth/v1/recover?redirect_to=" + encodeURIComponent(redirectTo), {
+      method: "POST",
+      body: JSON.stringify({ email }),
+    });
+  },
+
+  async resendSignupConfirmation(email: string): Promise<void> {
+    const redirectTo = `${window.location.origin}${window.location.pathname}`;
+    await authRequest("/auth/v1/resend?redirect_to=" + encodeURIComponent(redirectTo), {
+      method: "POST",
+      body: JSON.stringify({ type: "signup", email }),
+    });
+  },
+
+  async updatePassword(accessToken: string, password: string): Promise<void> {
+    await authRequest("/auth/v1/user", {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify({ password }),
+    });
+  },
+
+  async signUp(
+    email: string,
+    password: string,
+    phone: string,
+    termsVersion: string,
+  ): Promise<AuthSession | null> {
     const result = await authRequest<AuthSession | { user: AuthUser; session: AuthSession | null }>(
-      "/auth/v1/signup",
+      "/auth/v1/signup?redirect_to=" +
+        encodeURIComponent(`${window.location.origin}${window.location.pathname}`),
       {
         method: "POST",
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({
+          email,
+          password,
+          data: { phone, terms_accepted: true, terms_version: termsVersion },
+        }),
       },
     );
 
@@ -148,6 +307,19 @@ export const auth = {
       storeSession(null);
       throw new Error("Las cuentas nuevas solo pueden registrarse como usuario.");
     }
+    storeSession(authenticated);
+    return authenticated;
+  },
+
+  async updatePhone(phone: string): Promise<AuthSession> {
+    const session = readStoredSession();
+    if (!session) throw new Error("Inicia sesión para guardar tu teléfono.");
+
+    await supabaseRequest<string>("rpc/update_my_phone", {
+      method: "POST",
+      body: JSON.stringify({ new_phone: phone }),
+    });
+    const authenticated = await loadProfile(session);
     storeSession(authenticated);
     return authenticated;
   },

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, ReactNode } from "react";
-import { auth, supabaseRequest } from "./lib/supabase";
-import type { AuthRole, AuthSession, PartRow } from "./lib/supabase";
+import { auth, listManagedUsers, removePartImage, supabaseRequest, updateManagedUserRole, uploadPartImage } from "./lib/supabase";
+import type { AuthRole, AuthSession, ManagedUser, PartRow } from "./lib/supabase";
 
 /* =========================================================
    CATÁLOGO DE REPUESTOS (DESGUACE) – versión TypeScript
@@ -13,6 +13,7 @@ const CONFIG = {
   BUSINESS_NAME: "AutoPartes LIN",
   WHATSAPP: "573000000000", // código de país + número, sin + ni espacios
 };
+const TERMS_VERSION = "1.0";
 
 // Edita esta lista en el código para agregar o quitar palabras y frases.
 const CENSORED_WORDS = [
@@ -38,6 +39,8 @@ type Condition = "Excelente" | "Bueno" | "Regular" | "Para reparar";
 
 type Part = {
   id: number;
+  ownerId: string | null;
+  sellerPhone: string | null;
   code: string;
   name: string;
   category: string;
@@ -55,7 +58,7 @@ type Part = {
 };
 
 // Repuesto que todavía puede no tener id (cuando se está creando)
-type PartInput = Omit<Part, "id"> & { id?: number };
+type PartInput = Omit<Part, "id" | "ownerId" | "sellerPhone"> & { id?: number; ownerId?: string | null };
 
 // El formulario guarda todo como texto
 type FormState = {
@@ -90,8 +93,10 @@ const CATEGORIES: string[] = [
 const CONDITIONS: Condition[] = ["Excelente", "Bueno", "Regular", "Para reparar"];
 
 /* ---------------------- Capa de datos (Supabase) ---------------------- */
-const fromDb = (row: PartRow): Part => ({
+const fromDb = (row: PartRow, sellerPhone: string | null = null): Part => ({
   id: row.id,
+  ownerId: row.owner_id,
+  sellerPhone,
   code: row.code,
   name: row.name,
   category: row.category,
@@ -108,7 +113,7 @@ const fromDb = (row: PartRow): Part => ({
   notes: row.notes,
 });
 
-const toDb = (part: PartInput): Omit<PartRow, "id"> => ({
+const toDb = (part: PartInput): Omit<PartRow, "id" | "owner_id"> => ({
   code: part.code,
   name: part.name,
   category: part.category,
@@ -125,11 +130,22 @@ const toDb = (part: PartInput): Omit<PartRow, "id"> => ({
   notes: part.notes,
 });
 
+async function withSellerPhones(rows: PartRow[]): Promise<Part[]> {
+  const ownerIds = Array.from(new Set(rows.flatMap((row) => row.owner_id ? [row.owner_id] : [])));
+  if (ownerIds.length === 0) return rows.map((row) => fromDb(row));
+
+  const contacts = await supabaseRequest<Array<{ owner_id: string; phone: string }>>(
+    `seller_whatsapp?owner_id=in.(${ownerIds.map(encodeURIComponent).join(",")})&select=owner_id,phone`,
+  );
+  const phonesByOwner = new Map((contacts || []).map((contact) => [contact.owner_id, contact.phone]));
+  return rows.map((row) => fromDb(row, row.owner_id ? phonesByOwner.get(row.owner_id) || null : null));
+}
+
 const api = {
   async list(): Promise<Part[]> {
     const rows = await supabaseRequest<PartRow[]>("parts?select=*&order=id.desc");
     if (!rows) throw new Error("Supabase no devolvió el inventario.");
-    return rows.map(fromDb);
+    return withSellerPhones(rows);
   },
   async create(part: PartInput): Promise<Part> {
     const rows = await supabaseRequest<PartRow[]>("parts?select=*", {
@@ -138,9 +154,9 @@ const api = {
       body: JSON.stringify(toDb(part)),
     });
     if (!rows?.[0]) throw new Error("Supabase no devolvió el repuesto creado.");
-    return fromDb(rows[0]);
+    return (await withSellerPhones([rows[0]]))[0];
   },
-  async update(part: Part): Promise<Part> {
+  async update(part: PartInput & { id: number }): Promise<Part> {
     const rows = await supabaseRequest<PartRow[]>(
       `parts?id=eq.${part.id}&select=*`,
       {
@@ -150,7 +166,7 @@ const api = {
       },
     );
     if (!rows?.[0]) throw new Error("Supabase no encontró el repuesto que intentaste editar.");
-    return fromDb(rows[0]);
+    return (await withSellerPhones([rows[0]]))[0];
   },
   async remove(id: number): Promise<void> {
     await supabaseRequest<null>(`parts?id=eq.${id}`, { method: "DELETE" });
@@ -196,6 +212,12 @@ const toForm = (p: Part | null): FormState =>
     : EMPTY_FORM;
 
 const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : "Ocurrió un error inesperado");
+
+function phoneForWhatsApp(value: string): string | null {
+  const formatted = value.trim().replace(/[\s().-]/g, "");
+  if (!/^\+[1-9]\d{7,14}$/.test(formatted)) return null;
+  return formatted.slice(1);
+}
 
 /* ----------------------------- Hook ----------------------------- */
 function useParts() {
@@ -262,8 +284,20 @@ type PartFormProps = {
 
 function PartForm({ initial, onClose, onSave }: PartFormProps) {
   const [form, setForm] = useState<FormState>(toForm(initial));
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState("");
   const [saving, setSaving] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
+
+  useEffect(() => {
+    if (!imageFile) {
+      setImagePreview("");
+      return;
+    }
+    const preview = URL.createObjectURL(imageFile);
+    setImagePreview(preview);
+    return () => URL.revokeObjectURL(preview);
+  }, [imageFile]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -285,6 +319,7 @@ function PartForm({ initial, onClose, onSave }: PartFormProps) {
     setError("");
     const part: PartInput = {
       id: form.id,
+      ownerId: initial?.ownerId ?? null,
       code: form.code.trim(),
       name: form.name.trim(),
       category: form.category,
@@ -300,14 +335,48 @@ function PartForm({ initial, onClose, onSave }: PartFormProps) {
       image: form.image.trim(),
       notes: form.notes.trim(),
     };
+    let uploadedPath: string | null = null;
     try {
+      if (imageFile) {
+        const uploaded = await uploadPartImage(imageFile);
+        part.image = uploaded.url;
+        uploadedPath = uploaded.path;
+      }
       await onSave(part);
       onClose();
     } catch (e) {
-      setError(errorMessage(e));
+      let message = errorMessage(e);
+      if (uploadedPath) {
+        try {
+          await removePartImage(uploadedPath);
+        } catch (cleanupError) {
+          message += ` No pudimos limpiar la foto que se subió: ${errorMessage(cleanupError)}`;
+        }
+      }
+      setError(message);
       setSaving(false);
     }
   };
+
+  const selectImage = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      setImageFile(null);
+      setError("Elige una imagen JPG, PNG o WebP.");
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setImageFile(null);
+      setError("La foto no puede pesar más de 5 MB.");
+      return;
+    }
+    setError("");
+    setImageFile(file);
+  };
+
+  const preview = imagePreview || form.image;
 
   return (
     <div className="dz-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
@@ -355,8 +424,10 @@ function PartForm({ initial, onClose, onSave }: PartFormProps) {
           <label className="span2">Vehículo de donde salió
             <input value={form.donorVehicle} onChange={set("donorVehicle")} placeholder="Ej: Mazda 3 2016, siniestro lateral" />
           </label>
-          <label className="span2">URL de la foto
-            <input value={form.image} onChange={set("image")} placeholder="https://..." />
+          <label className="span2">Foto del producto
+            <input type="file" accept="image/jpeg,image/png,image/webp" onChange={selectImage} />
+            <small className="dz-image-help">Sube una foto desde tu dispositivo (JPG, PNG o WebP; máximo 5 MB).</small>
+            {preview && <img className="dz-image-preview" src={preview} alt="Vista previa de la foto del repuesto" />}
           </label>
           <label className="span2">Notas
             <textarea rows={2} value={form.notes} onChange={set("notes")} />
@@ -387,7 +458,7 @@ function whatsappLink(p: Part, words: readonly string[]): string {
   const text =
     "Hola, me interesa este repuesto: " + censorText(p.name, words) + " (" + censorText(p.code || "sin código", words) + ") " +
     [p.brand, p.model, years(p)].filter(Boolean).map((value) => censorText(String(value), words)).join(" ") + ". ¿Sigue disponible?";
-  return "https://wa.me/" + CONFIG.WHATSAPP + "?text=" + encodeURIComponent(text);
+  return "https://wa.me/" + (p.sellerPhone || CONFIG.WHATSAPP) + "?text=" + encodeURIComponent(text);
 }
 
 function PartImage({ part, censoredWords }: { part: Part; censoredWords: readonly string[] }) {
@@ -401,12 +472,13 @@ function PartImage({ part, censoredWords }: { part: Part; censoredWords: readonl
 type CardProps = {
   part: Part;
   admin: boolean;
+  canEdit: boolean;
   censoredWords: readonly string[];
   onEdit: (part: Part) => void;
   onDelete: (part: Part) => void;
 };
 
-function PartCard({ part, admin, censoredWords, onEdit, onDelete }: CardProps) {
+function PartCard({ part, admin, canEdit, censoredWords, onEdit, onDelete }: CardProps) {
   const s = stockInfo(part);
   return (
     <article className="dz-card">
@@ -425,10 +497,10 @@ function PartCard({ part, admin, censoredWords, onEdit, onDelete }: CardProps) {
           <span className="dz-cond">{part.condition}</span>
         </div>
 
-        {admin ? (
-          <div className="dz-admin-actions">
+        {canEdit ? (
+          <div className={"dz-admin-actions" + (admin ? "" : " is-single")}>
             <button className="dz-btn dz-btn-ghost" onClick={() => onEdit(part)}>Editar</button>
-            <button className="dz-btn dz-btn-danger" onClick={() => onDelete(part)}>Eliminar</button>
+            {admin && <button className="dz-btn dz-btn-danger" onClick={() => onDelete(part)}>Eliminar</button>}
           </div>
         ) : (
           <a
@@ -449,20 +521,22 @@ function PartCard({ part, admin, censoredWords, onEdit, onDelete }: CardProps) {
 type TableProps = {
   parts: Part[];
   admin: boolean;
+  userId?: string;
   censoredWords: readonly string[];
   onEdit: (part: Part) => void;
   onDelete: (part: Part) => void;
 };
 
-function PartsTable({ parts, admin, censoredWords, onEdit, onDelete }: TableProps) {
+function PartsTable({ parts, admin, userId, censoredWords, onEdit, onDelete }: TableProps) {
+  const canEditAny = parts.some((part) => admin || part.ownerId === userId);
   return (
     <div className="dz-table-wrap">
       <table className="dz-table">
         <thead>
           <tr>
             <th>Código</th><th>Repuesto</th><th>Vehículo</th><th>Estado</th>
-            <th>Stock</th><th>Ubicación</th><th className="num">Precio</th>
-            {admin && <th>Acciones</th>}
+            <th>Stock</th><th>Ubicación</th><th className="num">Precio</th><th>Contacto</th>
+            {canEditAny && <th>Acciones</th>}
           </tr>
         </thead>
         <tbody>
@@ -475,10 +549,21 @@ function PartsTable({ parts, admin, censoredWords, onEdit, onDelete }: TableProp
               <td>{p.stock}</td>
               <td>{censorText(p.location, censoredWords)}</td>
               <td className="num">{formatPrice(p.price)}</td>
-              {admin && (
+              <td>
+                {p.stock > 0 && (
+                  <a className="dz-link" href={whatsappLink(p, censoredWords)} target="_blank" rel="noreferrer">
+                    WhatsApp
+                  </a>
+                )}
+              </td>
+              {canEditAny && (
                 <td className="dz-row-actions">
-                  <button className="dz-link" onClick={() => onEdit(p)}>Editar</button>
-                  <button className="dz-link danger" onClick={() => onDelete(p)}>Eliminar</button>
+                  {(admin || p.ownerId === userId) && (
+                    <>
+                      <button className="dz-link" onClick={() => onEdit(p)}>Editar</button>
+                      {admin && <button className="dz-link danger" onClick={() => onDelete(p)}>Eliminar</button>}
+                    </>
+                  )}
                 </td>
               )}
             </tr>
@@ -496,14 +581,66 @@ type LoginModalProps = {
   role: AuthRole;
 };
 
+function TermsPrivacyModal({ onClose }: { onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div className="dz-overlay dz-terms-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="dz-modal dz-terms-modal" role="dialog" aria-modal="true" aria-label="Términos de uso y aviso de privacidad">
+        <h2>Términos de uso y aviso de privacidad</h2>
+        <p className="dz-login-help">AutoPartes LIN · Versión {TERMS_VERSION}</p>
+        <div className="dz-terms-content">
+          <section>
+            <h3>Uso del catálogo</h3>
+            <p>El sitio muestra autopartes usadas ofrecidas por vendedores. Las fotos y los datos de condición, precio, existencias y compatibilidad son informativos; confirma con el vendedor que la pieza corresponde a tu vehículo y sigue disponible antes de acordar la compra.</p>
+          </section>
+          <section>
+            <h3>Contacto y compras</h3>
+            <p>El botón de WhatsApp abre una conversación con el teléfono asociado al vendedor y prepara un mensaje sobre el repuesto. La conversación, el pago, la entrega, la garantía y cualquier devolución se acuerdan directamente entre comprador y vendedor; el sitio no procesa pagos ni confirma la compraventa. WhatsApp aplica sus propios términos y aviso de privacidad.</p>
+          </section>
+          <section>
+            <h3>Responsabilidades de quien publica</h3>
+            <p>Publica información veraz y mantén actualizado el inventario. Solo ofrece piezas que puedas vender legalmente y usa fotos propias o que tengas permiso para publicar. No publiques artículos robados o ilegales, datos personales de terceros, contenido engañoso ni mensajes abusivos o de spam.</p>
+          </section>
+          <section>
+            <h3>Datos que usamos</h3>
+            <p>Para operar la cuenta y el catálogo se usan el correo, el teléfono de WhatsApp, la información de los productos y sus fotos. La autenticación, base de datos y almacenamiento de imágenes utilizan Supabase. No escribas contraseñas ni información financiera o sensible en las publicaciones.</p>
+          </section>
+          <section>
+            <h3>Visibilidad y control del teléfono</h3>
+            <p>El teléfono no se muestra como texto en la ficha, pero queda disponible en el enlace de WhatsApp para que los visitantes contacten al vendedor de productos disponibles. Puedes actualizarlo desde “Mi WhatsApp” después de iniciar sesión. El correo y el rol de la cuenta no se muestran al público en el catálogo.</p>
+          </section>
+          <section>
+            <h3>Actualizaciones y solicitudes</h3>
+            <p>El inventario puede cambiar sin previo aviso. Para corregir datos de tu perfil o solicitar la revisión o eliminación de información, contacta al administrador de AutoPartes LIN. Estos términos pueden actualizarse; si cambia su versión, se pedirá nuevamente la aceptación al crear una cuenta.</p>
+          </section>
+        </div>
+        <div className="dz-modal-actions">
+          <button className="dz-btn dz-btn-primary" onClick={onClose}>Cerrar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function LoginModal({ onClose, onSignedIn, initialMode, role }: LoginModalProps) {
-  const [mode, setMode] = useState<"login" | "signup">(initialMode);
+  const [mode, setMode] = useState<"login" | "signup" | "recover">(initialMode);
   const [email, setEmail] = useState("");
+  const [phone, setPhone] = useState("");
+  const [termsAccepted, setTermsAccepted] = useState(false);
+  const [termsOpen, setTermsOpen] = useState(false);
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [confirmationPending, setConfirmationPending] = useState(false);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -514,8 +651,21 @@ function LoginModal({ onClose, onSignedIn, initialMode, role }: LoginModalProps)
   }, [onClose]);
 
   const submit = async () => {
-    if (!email.trim() || !password) {
-      setError("Ingresa tu correo y contraseña.");
+    if (!email.trim()) {
+      setError("Ingresa tu correo electrónico.");
+      return;
+    }
+    const normalizedPhone = mode === "signup" ? phoneForWhatsApp(phone) : null;
+    if (mode === "signup" && !normalizedPhone) {
+      setError("Ingresa tu teléfono con código de país, por ejemplo +573001234567.");
+      return;
+    }
+    if (mode === "signup" && !termsAccepted) {
+      setError("Debes aceptar los términos de uso y el aviso de privacidad para crear una cuenta.");
+      return;
+    }
+    if (mode !== "recover" && !password) {
+      setError("Ingresa tu contraseña.");
       return;
     }
     if (mode === "signup" && password.length < 6) {
@@ -530,18 +680,231 @@ function LoginModal({ onClose, onSignedIn, initialMode, role }: LoginModalProps)
     setError("");
     setNotice("");
     try {
-      if (mode === "signup") {
-        const session = await auth.signUp(email.trim(), password);
+      if (mode === "recover") {
+        await auth.recoverPassword(email.trim());
+        setNotice("Si existe una cuenta con ese correo, recibirás un enlace para cambiar la contraseña.");
+      } else if (mode === "signup") {
+        if (!normalizedPhone) throw new Error("Ingresa un teléfono válido con código de país.");
+        const session = await auth.signUp(email.trim(), password, normalizedPhone, TERMS_VERSION);
         if (session) {
           onSignedIn(session);
           onClose();
         } else {
+          setConfirmationPending(true);
           setNotice("Cuenta creada. Revisa tu correo y confirma la dirección antes de iniciar sesión.");
         }
       } else {
         onSignedIn(await auth.signIn(email.trim(), password, role));
         onClose();
       }
+    } catch (e) {
+      const message = errorMessage(e);
+      if (mode === "login" && /email not confirmed|email_not_confirmed/i.test(message)) {
+        setConfirmationPending(true);
+        setNotice("Tu correo aún no está confirmado. Puedes solicitar otro enlace de confirmación.");
+      } else {
+        setError(message);
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const resendConfirmation = async () => {
+    if (!email.trim()) {
+      setError("Ingresa el correo electrónico de tu cuenta.");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      await auth.resendSignupConfirmation(email.trim());
+      setNotice("Si la cuenta necesita confirmación, enviaremos un nuevo enlace. Revisa también tu carpeta de spam.");
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="dz-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+        <div className="dz-modal dz-login-modal" role="dialog" aria-modal="true" aria-label={mode === "recover" ? "Recuperar contraseña" : mode === "signup" ? "Crear cuenta de usuario" : `Acceso de ${role === "admin" ? "administrador" : "usuario"}`}>
+          <h2>{mode === "recover" ? "Recuperar contraseña" : mode === "signup" ? "Crear cuenta de usuario" : `Acceso de ${role === "admin" ? "administrador" : "usuario"}`}</h2>
+          <p className="dz-login-help">
+          {mode === "recover"
+            ? "Ingresa el correo de tu cuenta y te enviaremos un enlace para cambiarla."
+            : mode === "signup"
+            ? "Regístrate para iniciar sesión como usuario."
+            : role === "admin"
+              ? "Este acceso es exclusivo para cuentas autorizadas como administrador."
+              : "Inicia sesión con tu cuenta de usuario."}
+        </p>
+          <div className="dz-login-form">
+            <label>
+              Correo electrónico
+              <input
+                type="email"
+                value={email}
+                onChange={(event) => {
+                  setEmail(event.target.value);
+                  setConfirmationPending(false);
+                }}
+                autoComplete="email"
+              />
+            </label>
+            {mode === "signup" && (
+              <label>
+                Teléfono WhatsApp con código de país
+                <input
+                  type="tel"
+                  value={phone}
+                  onChange={(event) => setPhone(event.target.value)}
+                  placeholder="+573001234567"
+                  autoComplete="tel"
+                  required
+                />
+                <small className="dz-phone-help">Este número se compartirá con compradores para contactar tus repuestos disponibles por WhatsApp.</small>
+              </label>
+            )}
+            {mode !== "recover" && (
+              <label>
+                Contraseña
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  autoComplete={mode === "signup" ? "new-password" : "current-password"}
+                  onKeyDown={(event) => event.key === "Enter" && void submit()}
+                />
+              </label>
+            )}
+            {mode === "signup" && (
+              <label>
+                Confirmar contraseña
+                <input
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(event) => setConfirmPassword(event.target.value)}
+                  autoComplete="new-password"
+                  onKeyDown={(event) => event.key === "Enter" && void submit()}
+                />
+              </label>
+            )}
+          </div>
+          {mode === "signup" && (
+            <div className="dz-terms-accept">
+              <label className="dz-terms-check">
+                <input
+                  type="checkbox"
+                  checked={termsAccepted}
+                  onChange={(event) => {
+                    setTermsAccepted(event.target.checked);
+                    if (event.target.checked) setError("");
+                  }}
+                />
+                <span>Acepto los Términos de uso y el Aviso de privacidad (versión {TERMS_VERSION}).</span>
+              </label>
+              <button className="dz-auth-mode" type="button" onClick={() => setTermsOpen(true)}>
+                Leer términos y aviso de privacidad
+              </button>
+            </div>
+          )}
+          {error && <p className="dz-form-error" role="alert">{error}</p>}
+          {notice && <p className="dz-form-notice" role="status">{notice}</p>}
+          {confirmationPending && mode !== "recover" && (
+            <button className="dz-auth-mode" type="button" onClick={() => void resendConfirmation()} disabled={saving}>
+              {saving ? "Enviando..." : "Reenviar correo de confirmación"}
+            </button>
+          )}
+          {mode === "login" && (
+            <button
+              className="dz-auth-mode"
+              type="button"
+              onClick={() => {
+                setMode("recover");
+                setError("");
+                setNotice("");
+              }}
+            >
+              ¿Olvidaste tu contraseña?
+            </button>
+          )}
+          {role === "user" && mode !== "recover" && (
+            <button
+              className="dz-auth-mode"
+              type="button"
+              onClick={() => {
+                setMode(mode === "signup" ? "login" : "signup");
+                setError("");
+                setNotice("");
+              }}
+            >
+              {mode === "signup" ? "Ya tengo una cuenta" : "Crear una cuenta nueva"}
+            </button>
+          )}
+          {mode === "recover" && (
+            <button
+              className="dz-auth-mode"
+              type="button"
+              onClick={() => {
+                setMode("login");
+                setError("");
+                setNotice("");
+              }}
+            >
+              Volver al inicio de sesión
+            </button>
+          )}
+          <div className="dz-modal-actions">
+            <button className="dz-btn dz-btn-ghost" onClick={onClose} disabled={saving}>Cancelar</button>
+            <button className="dz-btn dz-btn-primary" onClick={() => void submit()} disabled={saving}>
+              {saving
+                ? (mode === "recover" ? "Enviando..." : mode === "signup" ? "Creando cuenta..." : "Ingresando...")
+                : (mode === "recover" ? "Enviar enlace" : mode === "signup" ? "Crear cuenta" : "Iniciar sesión")}
+            </button>
+          </div>
+        </div>
+      </div>
+      {termsOpen && <TermsPrivacyModal onClose={() => setTermsOpen(false)} />}
+    </>
+  );
+}
+
+function PhoneModal({
+  currentPhone,
+  onClose,
+  onSaved,
+}: {
+  currentPhone: string | null | undefined;
+  onClose: () => void;
+  onSaved: (session: AuthSession) => void;
+}) {
+  const [phone, setPhone] = useState(currentPhone ? `+${currentPhone}` : "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const submit = async () => {
+    const normalizedPhone = phoneForWhatsApp(phone);
+    if (!normalizedPhone) {
+      setError("Ingresa tu teléfono con código de país, por ejemplo +573001234567.");
+      return;
+    }
+
+    setSaving(true);
+    setError("");
+    try {
+      onSaved(await auth.updatePhone(normalizedPhone));
+      onClose();
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -551,65 +914,210 @@ function LoginModal({ onClose, onSignedIn, initialMode, role }: LoginModalProps)
 
   return (
     <div className="dz-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="dz-modal dz-login-modal" role="dialog" aria-modal="true" aria-label={mode === "signup" ? "Crear cuenta de usuario" : `Acceso de ${role === "admin" ? "administrador" : "usuario"}`}>
-        <h2>{mode === "signup" ? "Crear cuenta de usuario" : `Acceso de ${role === "admin" ? "administrador" : "usuario"}`}</h2>
-        <p className="dz-login-help">
-          {mode === "signup"
-            ? "Regístrate para iniciar sesión como usuario."
-            : role === "admin"
-              ? "Este acceso es exclusivo para cuentas autorizadas como administrador."
-              : "Inicia sesión con tu cuenta de usuario."}
-        </p>
+      <div className="dz-modal dz-login-modal" role="dialog" aria-modal="true" aria-label="Teléfono de WhatsApp">
+        <h2>Teléfono de WhatsApp</h2>
+        <p className="dz-login-help">Los compradores podrán abrir un chat contigo desde tus repuestos disponibles.</p>
         <div className="dz-login-form">
           <label>
-            Correo electrónico
-            <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" />
-          </label>
-          <label>
-            Contraseña
+            Número con código de país
             <input
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              autoComplete="current-password"
-              onKeyDown={(event) => event.key === "Enter" && void submit()}
+              type="tel"
+              value={phone}
+              onChange={(event) => setPhone(event.target.value)}
+              placeholder="+573001234567"
+              autoComplete="tel"
+              required
+              autoFocus
             />
           </label>
-          {mode === "signup" && (
-            <label>
-              Confirmar contraseña
-              <input
-                type="password"
-                value={confirmPassword}
-                onChange={(event) => setConfirmPassword(event.target.value)}
-                autoComplete="new-password"
-                onKeyDown={(event) => event.key === "Enter" && void submit()}
-              />
-            </label>
-          )}
         </div>
         {error && <p className="dz-form-error" role="alert">{error}</p>}
-        {notice && <p className="dz-form-notice" role="status">{notice}</p>}
-        {role === "user" && (
-          <button
-            className="dz-auth-mode"
-            type="button"
-            onClick={() => {
-              setMode(mode === "signup" ? "login" : "signup");
-              setError("");
-              setNotice("");
-            }}
-          >
-            {mode === "signup" ? "Ya tengo una cuenta" : "Crear una cuenta nueva"}
-          </button>
-        )}
         <div className="dz-modal-actions">
           <button className="dz-btn dz-btn-ghost" onClick={onClose} disabled={saving}>Cancelar</button>
           <button className="dz-btn dz-btn-primary" onClick={() => void submit()} disabled={saving}>
-            {saving
-              ? (mode === "signup" ? "Creando cuenta..." : "Ingresando...")
-              : (mode === "signup" ? "Crear cuenta" : "Iniciar sesión")}
+            {saving ? "Guardando..." : "Guardar teléfono"}
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PasswordResetModal({ accessToken, onClose }: { accessToken: string; onClose: () => void }) {
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [complete, setComplete] = useState(false);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const submit = async () => {
+    if (password.length < 6) {
+      setError("La contraseña debe tener al menos 6 caracteres.");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError("Las contraseñas no coinciden.");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      await auth.updatePassword(accessToken, password);
+      setComplete(true);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="dz-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="dz-modal dz-login-modal" role="dialog" aria-modal="true" aria-label="Cambiar contraseña">
+        <h2>{complete ? "Contraseña actualizada" : "Elige una nueva contraseña"}</h2>
+        {complete ? (
+          <>
+            <p className="dz-form-notice" role="status">Ya puedes iniciar sesión con tu nueva contraseña.</p>
+            <div className="dz-modal-actions">
+              <button className="dz-btn dz-btn-primary" onClick={onClose}>Listo</button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p className="dz-login-help">La nueva contraseña debe tener al menos 6 caracteres.</p>
+            <div className="dz-login-form">
+              <label>
+                Nueva contraseña
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  autoComplete="new-password"
+                />
+              </label>
+              <label>
+                Confirmar nueva contraseña
+                <input
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(event) => setConfirmPassword(event.target.value)}
+                  autoComplete="new-password"
+                  onKeyDown={(event) => event.key === "Enter" && void submit()}
+                />
+              </label>
+            </div>
+            {error && <p className="dz-form-error" role="alert">{error}</p>}
+            <div className="dz-modal-actions">
+              <button className="dz-btn dz-btn-ghost" onClick={onClose} disabled={saving}>Cancelar</button>
+              <button className="dz-btn dz-btn-primary" onClick={() => void submit()} disabled={saving}>
+                {saving ? "Guardando..." : "Cambiar contraseña"}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function UserManagementModal({
+  currentUserId,
+  onClose,
+}: {
+  currentUserId: string;
+  onClose: () => void;
+}) {
+  const [users, setUsers] = useState<ManagedUser[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [savingUserId, setSavingUserId] = useState<string | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    void listManagedUsers()
+      .then((rows) => {
+        if (active) setUsers(rows);
+      })
+      .catch((e: unknown) => {
+        if (active) setError(errorMessage(e));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const changeRole = async (user: ManagedUser, role: AuthRole) => {
+    if (user.id === currentUserId || user.role === role) return;
+    setSavingUserId(user.id);
+    setError("");
+    try {
+      const updated = await updateManagedUserRole(user.id, role);
+      setUsers((current) => current.map((item) => item.id === updated.id ? updated : item));
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setSavingUserId(null);
+    }
+  };
+
+  return (
+    <div className="dz-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="dz-modal dz-users-modal" role="dialog" aria-modal="true" aria-label="Administrar usuarios">
+        <h2>Administrar usuarios</h2>
+        <p className="dz-login-help">Cambia el acceso de cada cuenta. Tu propio rol está protegido para evitar perder el acceso de administrador.</p>
+        {loading ? (
+          <p role="status">Cargando usuarios...</p>
+        ) : users.length === 0 ? (
+          <p>No hay cuentas registradas.</p>
+        ) : (
+          <div className="dz-user-list">
+            {users.map((user) => {
+              const isCurrentUser = user.id === currentUserId;
+              return (
+                <div className="dz-user-row" key={user.id}>
+                  <div className="dz-user-details">
+                    <strong>{user.email || "Correo no disponible"}</strong>
+                    {isCurrentUser && <small>Tu cuenta</small>}
+                  </div>
+                  <select
+                    value={user.role}
+                    aria-label={`Rol de ${user.email || "la cuenta"}`}
+                    disabled={isCurrentUser || savingUserId === user.id}
+                    onChange={(event) => {
+                      const role = event.target.value;
+                      if (role === "admin" || role === "user") void changeRole(user, role);
+                    }}
+                  >
+                    <option value="user">Usuario</option>
+                    <option value="admin">Administrador</option>
+                  </select>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {error && <p className="dz-form-error" role="alert">{error}</p>}
+        <div className="dz-modal-actions">
+          <button className="dz-btn dz-btn-ghost" onClick={onClose}>Cerrar</button>
         </div>
       </div>
     </div>
@@ -629,11 +1137,46 @@ export default function App() {
   const [session, setSession] = useState<AuthSession | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [authError, setAuthError] = useState("");
+  const [authNotice, setAuthNotice] = useState("");
   const [loginOpen, setLoginOpen] = useState(false);
   const [authMode, setAuthMode] = useState<"login" | "signup">("login");
   const [authRole, setAuthRole] = useState<AuthRole>("user");
   const [editing, setEditing] = useState<Part | "new" | null>(null);
+  const [passwordRecoveryToken, setPasswordRecoveryToken] = useState<string | null>(null);
+  const [userManagementOpen, setUserManagementOpen] = useState(false);
+  const [phoneEditorOpen, setPhoneEditorOpen] = useState(false);
   const admin = session?.user.accountRole === "admin";
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.hash.slice(1));
+    const type = params.get("type");
+    const accessToken = params.get("access_token");
+    if (type === "recovery" && accessToken) {
+      setPasswordRecoveryToken(accessToken);
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    } else if (type === "signup" && accessToken) {
+      const refreshToken = params.get("refresh_token") || "";
+      const expiresIn = Number(params.get("expires_in")) || 0;
+      const expiresAt = Number(params.get("expires_at")) || (expiresIn ? Math.floor(Date.now() / 1000) + expiresIn : 0);
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      void auth.confirmSignup(accessToken, refreshToken, expiresAt)
+        .then((authenticated) => {
+          setSession(authenticated);
+          setAuthError("");
+          setAuthNotice("Correo confirmado. Ya iniciaste sesión.");
+        })
+        .catch((e: unknown) => setAuthError(errorMessage(e)));
+    } else if (type === "recovery") {
+      setAuthError(params.get("error_description") || "El enlace para cambiar la contraseña no es válido o ya venció.");
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    } else {
+      const errorDescription = params.get("error_description");
+      if (errorDescription) {
+        setAuthError(errorDescription);
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      }
+    }
+  }, []);
 
   useEffect(() => {
     void auth.getSession()
@@ -651,6 +1194,19 @@ export default function App() {
   const handleSignedIn = (nextSession: AuthSession) => {
     setSession(nextSession);
     setAuthError("");
+  };
+
+  const handlePhoneSaved = (nextSession: AuthSession) => {
+    setSession(nextSession);
+    setAuthError("");
+    setAuthNotice("Tu teléfono de WhatsApp se guardó correctamente.");
+    void reload();
+  };
+
+  const openLogin = (role: AuthRole, mode: "login" | "signup") => {
+    setAuthRole(role);
+    setAuthMode(mode);
+    setLoginOpen(true);
   };
 
   const brands = useMemo<string[]>(
@@ -697,25 +1253,92 @@ export default function App() {
               <small>Repuestos usados para carros</small>
             </div>
           </div>
-          {authLoading ? null : session ? (
-            <div className="dz-auth-actions">
-              <span className="dz-user">
-                {session.user.email || (admin ? "Administrador" : "Usuario")} · {admin ? "Administrador" : "Usuario"}
-              </span>
-              <button className="dz-login-button" onClick={() => void signOut()}>Cerrar sesión</button>
-            </div>
-          ) : (
-            <div className="dz-auth-actions">
-              <button className="dz-login-button" onClick={() => { setAuthRole("admin"); setAuthMode("login"); setLoginOpen(true); }}>Acceso administrador</button>
-              <button className="dz-login-button" onClick={() => { setAuthRole("user"); setAuthMode("login"); setLoginOpen(true); }}>Acceso usuario</button>
-              <button className="dz-login-button dz-signup-button" onClick={() => { setAuthRole("user"); setAuthMode("signup"); setLoginOpen(true); }}>Crear cuenta</button>
-            </div>
+          {authLoading ? null : (
+            <>
+              {session ? (
+                <div className="dz-auth-actions dz-desktop-auth">
+                  <span className="dz-user">
+                    {session.user.email || (admin ? "Administrador" : "Usuario")} · {admin ? "Administrador" : "Usuario"}
+                  </span>
+                  <button className="dz-login-button" onClick={() => setPhoneEditorOpen(true)}>
+                    {session.user.phone ? "Mi WhatsApp" : "Agregar WhatsApp"}
+                  </button>
+                  {admin && (
+                    <button className="dz-login-button" onClick={() => setUserManagementOpen(true)}>
+                      Administrar usuarios
+                    </button>
+                  )}
+                  <button className="dz-login-button" onClick={() => void signOut()}>Cerrar sesión</button>
+                </div>
+              ) : (
+                <div className="dz-auth-actions dz-desktop-auth">
+                  <button className="dz-login-button" onClick={() => openLogin("admin", "login")}>Acceso administrador</button>
+                  <button className="dz-login-button" onClick={() => openLogin("user", "login")}>Acceso usuario</button>
+                  <button className="dz-login-button dz-signup-button" onClick={() => openLogin("user", "signup")}>Crear cuenta</button>
+                </div>
+              )}
+              <details className="dz-mobile-auth">
+                <summary>{session ? "Cuenta" : "Acceder"}</summary>
+                <div className="dz-mobile-auth-menu">
+                  {session ? (
+                    <>
+                      <span className="dz-mobile-user">{session.user.email || (admin ? "Administrador" : "Usuario")}</span>
+                      <button
+                        className="dz-login-button"
+                        onClick={(event) => {
+                          event.currentTarget.closest("details")?.removeAttribute("open");
+                          setPhoneEditorOpen(true);
+                        }}
+                      >
+                        {session.user.phone ? "Mi WhatsApp" : "Agregar WhatsApp"}
+                      </button>
+                      {admin && (
+                        <button
+                          className="dz-login-button"
+                          onClick={(event) => {
+                            event.currentTarget.closest("details")?.removeAttribute("open");
+                            setUserManagementOpen(true);
+                          }}
+                        >
+                          Administrar usuarios
+                        </button>
+                      )}
+                      <button
+                        className="dz-login-button"
+                        onClick={(event) => {
+                          event.currentTarget.closest("details")?.removeAttribute("open");
+                          void signOut();
+                        }}
+                      >
+                        Cerrar sesión
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button className="dz-login-button" onClick={(event) => {
+                        event.currentTarget.closest("details")?.removeAttribute("open");
+                        openLogin("user", "login");
+                      }}>Acceso usuario</button>
+                      <button className="dz-login-button" onClick={(event) => {
+                        event.currentTarget.closest("details")?.removeAttribute("open");
+                        openLogin("admin", "login");
+                      }}>Acceso administrador</button>
+                      <button className="dz-login-button" onClick={(event) => {
+                        event.currentTarget.closest("details")?.removeAttribute("open");
+                        openLogin("user", "signup");
+                      }}>Crear cuenta</button>
+                    </>
+                  )}
+                </div>
+              </details>
+            </>
           )}
         </div>
       </header>
 
       <main className="dz-container dz-main">
         {authError && <div className="dz-alert" role="alert">No pudimos verificar tu sesión. {authError}</div>}
+        {authNotice && <div className="dz-form-notice" role="status">{authNotice}</div>}
         <section className="dz-intro">
           <div>
             <h1>Encuentra el repuesto que necesitas</h1>
@@ -782,11 +1405,11 @@ export default function App() {
           view === "cards" ? (
             <section className="dz-grid">
               {filtered.map((p) => (
-                <PartCard key={p.id} part={p} admin={admin} censoredWords={CENSORED_WORDS} onEdit={setEditing} onDelete={(part) => void handleDelete(part)} />
+                <PartCard key={p.id} part={p} admin={admin} canEdit={admin || p.ownerId === session?.user.id} censoredWords={CENSORED_WORDS} onEdit={setEditing} onDelete={(part) => void handleDelete(part)} />
               ))}
             </section>
           ) : (
-            <PartsTable parts={filtered} admin={admin} censoredWords={CENSORED_WORDS} onEdit={setEditing} onDelete={(part) => void handleDelete(part)} />
+            <PartsTable parts={filtered} admin={admin} userId={session?.user.id} censoredWords={CENSORED_WORDS} onEdit={setEditing} onDelete={(part) => void handleDelete(part)} />
           )
         )}
       </main>
@@ -805,6 +1428,25 @@ export default function App() {
           onSignedIn={handleSignedIn}
           initialMode={authMode}
           role={authRole}
+        />
+      )}
+      {phoneEditorOpen && session && (
+        <PhoneModal
+          currentPhone={session.user.phone}
+          onClose={() => setPhoneEditorOpen(false)}
+          onSaved={handlePhoneSaved}
+        />
+      )}
+      {passwordRecoveryToken && (
+        <PasswordResetModal
+          accessToken={passwordRecoveryToken}
+          onClose={() => setPasswordRecoveryToken(null)}
+        />
+      )}
+      {admin && userManagementOpen && session && (
+        <UserManagementModal
+          currentUserId={session.user.id}
+          onClose={() => setUserManagementOpen(false)}
         />
       )}
     </div>
@@ -838,11 +1480,34 @@ const css = `
 .dz-user { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: #d8dadd; }
 .dz-login-button { min-height: 38px; border: 1px solid #69717a; border-radius: 8px; background: #38404a; color: #fff; padding: 0 12px; font-weight: 600; }
 .dz-login-button:hover { background: #46505b; }
+.dz-mobile-auth { display: none; position: relative; }
+.dz-mobile-auth summary { display: grid; place-items: center; min-height: 44px; padding: 0 12px; border: 1px solid #69717a; border-radius: 8px; background: #38404a; color: #fff; font-size: 14px; font-weight: 600; list-style: none; cursor: pointer; }
+.dz-mobile-auth summary::-webkit-details-marker { display: none; }
+.dz-mobile-auth-menu { position: absolute; top: calc(100% + 8px); right: 0; z-index: 21; display: grid; gap: 8px; width: min(240px, calc(100vw - 24px)); padding: 10px; border: 1px solid #69717a; border-radius: 10px; background: var(--graphite); box-shadow: 0 10px 24px rgba(0,0,0,.24); }
+.dz-mobile-auth-menu .dz-login-button { width: 100%; min-height: 44px; text-align: left; }
+.dz-mobile-user { overflow-wrap: anywhere; color: #d8dadd; font-size: 12px; }
 .dz-login-modal { max-width: 420px; }
+.dz-users-modal { max-width: 620px; }
+.dz-terms-modal { display: flex; flex-direction: column; max-width: 760px; max-height: calc(100vh - 48px); }
+.dz-terms-overlay { z-index: 51; }
+.dz-terms-content { display: grid; gap: 14px; overflow-y: auto; padding: 2px 4px 2px 0; }
+.dz-terms-content h3 { margin: 0 0 4px; font-size: 15px; }
+.dz-terms-content p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
+.dz-terms-accept { display: grid; gap: 2px; margin-top: 14px; }
+.dz-terms-check { display: flex; align-items: flex-start; gap: 9px; font-size: 13px; line-height: 1.45; cursor: pointer; }
+.dz-terms-check input { flex: 0 0 auto; width: 17px; height: 17px; margin: 2px 0 0; accent-color: var(--steel); }
+.dz-user-list { display: grid; gap: 8px; max-height: min(60vh, 480px); overflow-y: auto; }
+.dz-user-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+.dz-user-details { min-width: 0; display: grid; gap: 3px; }
+.dz-user-details strong { overflow: hidden; text-overflow: ellipsis; }
+.dz-user-details small { color: var(--muted); font-size: 12px; }
+.dz-user-row select { min-width: 145px; border: 1px solid #c9c6bf; border-radius: 8px; padding: 8px 10px; background: #fff; }
+.dz-user-row select:disabled { opacity: .7; }
 .dz-login-help { margin: -8px 0 16px; color: var(--muted); font-size: 14px; }
 .dz-login-form { display: grid; gap: 12px; }
 .dz-login-form label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; font-weight: 600; }
 .dz-login-form input { border: 1px solid #c9c6bf; border-radius: 8px; padding: 10px; font-weight: 400; }
+.dz-phone-help { color: var(--muted); font-size: 12px; font-weight: 400; }
 .dz-signup-button { background: transparent; border-color: #b1b7bd; }
 .dz-auth-mode { border: 0; background: transparent; color: var(--steel); padding: 10px 0 0; font-weight: 600; }
 .dz-form-notice { color: var(--ok); margin: 12px 0 0; font-size: 14px; }
@@ -889,6 +1554,7 @@ const css = `
 @media (max-width: 760px)  { .dz-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .dz-intro h1 { font-size: 24px; } }
 @media (max-width: 600px)  { .dz-header-inner { height: auto; min-height: 64px; flex-wrap: wrap; padding-top: 10px; padding-bottom: 10px; } .dz-auth-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; gap: 8px; } }
 @media (max-width: 480px)  { .dz-grid { grid-template-columns: 1fr; } .dz-view { margin-left: 0; } }
+@media (max-width: 480px)  { .dz-user-row { align-items: stretch; flex-direction: column; } .dz-user-row select { width: 100%; } }
 
 .dz-card { display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
 .dz-card-media { position: relative; aspect-ratio: 4 / 3; background: #e7e5e0; }
@@ -906,6 +1572,7 @@ const css = `
 .dz-price { font-size: 21px; font-weight: 700; }
 .dz-cond { font-size: 12px; background: #ece9e3; border-radius: 999px; padding: 3px 10px; color: #4a4f56; white-space: nowrap; }
 .dz-admin-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.dz-admin-actions.is-single { grid-template-columns: 1fr; }
 
 /* Tabla */
 .dz-table-wrap { overflow-x: auto; background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
@@ -930,9 +1597,64 @@ const css = `
 .dz-form label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; font-weight: 600; color: #3b4047; }
 .dz-form .span2 { grid-column: span 2; }
 .dz-form input, .dz-form select, .dz-form textarea { border: 1px solid #c9c6bf; border-radius: 8px; padding: 9px 10px; font-weight: 400; color: var(--ink); background: #fff; }
+.dz-form input[type="file"] { width: 100%; }
+.dz-image-help { color: var(--muted); font-size: 12px; font-weight: 400; }
+.dz-image-preview { width: 100%; max-height: 220px; object-fit: contain; border-radius: 8px; background: #f2f1ee; }
 .dz-form-error { color: var(--bad); margin: 12px 0 0; font-size: 14px; }
 .dz-modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 @media (max-width: 520px) { .dz-form { grid-template-columns: 1fr; } .dz-form .span2 { grid-column: span 1; } }
+
+@media (max-width: 600px) {
+  .dz-container { padding-left: 12px; padding-right: 12px; }
+  .dz-main { padding-top: 18px; padding-bottom: 40px; }
+  .dz-header-inner { align-items: center; height: 64px; min-height: 64px; flex-wrap: nowrap; gap: 10px; padding-top: 0; padding-bottom: 0; }
+  .dz-brand { width: auto; min-width: 0; flex: 1; }
+  .dz-brand strong { font-size: 16px; }
+  .dz-brand small { font-size: 11px; white-space: nowrap; }
+  .dz-desktop-auth { display: none; }
+  .dz-mobile-auth { display: block; flex: 0 0 auto; }
+  .dz-auth-actions { gap: 8px; }
+  .dz-login-button { min-width: 0; min-height: 44px; padding: 6px 8px; font-size: 13px; }
+  .dz-intro { align-items: stretch; gap: 12px; margin-bottom: 16px; }
+  .dz-intro h1 { font-size: 23px; }
+  .dz-intro p { font-size: 14px; }
+  .dz-intro > .dz-btn { width: 100%; min-height: 44px; }
+  .dz-toolbar { padding: 10px; gap: 10px; }
+  .dz-search { height: 46px; }
+  .dz-search input { min-width: 0; font-size: 16px; }
+  .dz-filters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .dz-filters select { width: 100%; min-width: 0; height: 44px; font-size: 14px; }
+  .dz-check { grid-column: 1 / -1; min-height: 44px; margin: 0; padding: 0 6px; }
+  .dz-view { grid-column: 1 / -1; width: 100%; margin: 0; }
+  .dz-view button { flex: 1; height: 44px; }
+  .dz-count { margin: 12px 2px; }
+  .dz-grid { grid-template-columns: 1fr; gap: 12px; }
+  .dz-card { display: grid; grid-template-columns: minmax(105px, 36%) minmax(0, 1fr); border-radius: 12px; }
+  .dz-card-media { min-height: 156px; aspect-ratio: auto; }
+  .dz-card-body { min-width: 0; padding: 11px; gap: 5px; }
+  .dz-card .dz-btn { min-height: 44px; height: auto; padding-top: 8px; padding-bottom: 8px; }
+  .dz-card h3, .dz-code, .dz-fit, .dz-loc { overflow-wrap: anywhere; }
+  .dz-card h3 { font-size: 16px; }
+  .dz-code { font-size: 11px; }
+  .dz-fit, .dz-loc { font-size: 12px; }
+  .dz-card-row { align-items: flex-start; flex-direction: column; gap: 4px; padding-top: 6px; }
+  .dz-price { font-size: 18px; }
+  .dz-cond { white-space: normal; }
+  .dz-admin-actions { grid-template-columns: 1fr; }
+  .dz-admin-actions .dz-btn { min-height: 42px; padding-left: 8px; padding-right: 8px; }
+  .dz-overlay { padding: 8px; }
+  .dz-modal { padding: 16px; }
+  .dz-terms-modal { max-height: calc(100vh - 16px); }
+  .dz-modal-actions { flex-direction: column-reverse; }
+  .dz-modal-actions .dz-btn { width: 100%; min-height: 44px; }
+  .dz-form input, .dz-form select, .dz-form textarea, .dz-login-form input { font-size: 16px; }
+  .dz-table-wrap { max-width: 100%; overscroll-behavior-x: contain; }
+}
+
+@media (max-width: 360px) {
+  .dz-card { grid-template-columns: minmax(92px, 32%) minmax(0, 1fr); }
+  .dz-card-body { padding: 9px; }
+}
 
 @media (prefers-reduced-motion: reduce) { .dz * { transition: none !important; } }
 `;
