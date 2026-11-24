@@ -48,6 +48,26 @@ const PART_IMAGE_EXTENSIONS: Record<string, string> = {
   "image/webp": "webp",
 };
 
+function createUploadId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    crypto.getRandomValues(bytes);
+  } else {
+    bytes.forEach((_, index) => {
+      bytes[index] = Math.floor(Math.random() * 256);
+    });
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function readStoredSession(): AuthSession | null {
   try {
     const value = window.localStorage.getItem(AUTH_STORAGE_KEY);
@@ -101,7 +121,7 @@ export async function uploadPartImage(file: File): Promise<{ url: string; path: 
   if (!session) throw new Error("Inicia sesión para subir fotos de repuestos.");
 
   const { url, anonKey } = getSupabaseConfig();
-  const path = `${session.user.id}/${crypto.randomUUID()}.${extension}`;
+  const path = `${session.user.id}/${createUploadId()}.${extension}`;
   const response = await fetch(
     `${url}/storage/v1/object/${PART_IMAGES_BUCKET}/${path}`,
     {
