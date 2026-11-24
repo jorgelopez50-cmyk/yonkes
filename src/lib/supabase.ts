@@ -86,16 +86,24 @@ function storeSession(session: AuthSession | null) {
 }
 
 function getSupabaseConfig() {
-  const url = import.meta.env.VITE_SUPABASE_URL;
-  const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+  const url = import.meta.env.VITE_SUPABASE_URL || import.meta.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anonKey =
+    import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+    import.meta.env.VITE_SUPABASE_ANON_KEY ||
+    import.meta.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
+    import.meta.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
   if (!url || !anonKey) {
     throw new Error(
-      "Falta la configuración de Supabase. Define VITE_SUPABASE_URL y VITE_SUPABASE_ANON_KEY en .env.local.",
+      "Falta la configuración de Supabase. Define la URL del proyecto y una clave publishable en las variables VITE_SUPABASE_* o NEXT_PUBLIC_SUPABASE_*.",
     );
   }
 
   return { url: url.replace(/\/$/, ""), anonKey };
+}
+
+function isPublishableKey(apiKey: string): boolean {
+  return apiKey.startsWith("sb_publishable_");
 }
 
 function getStorageErrorMessage(body: string, status: number): string {
@@ -187,7 +195,11 @@ export async function supabaseRequest<T>(
   const headers = new Headers(options.headers);
   headers.set("apikey", anonKey);
   const session = readStoredSession();
-  headers.set("Authorization", `Bearer ${session?.access_token || anonKey}`);
+  if (session) {
+    headers.set("Authorization", `Bearer ${session.access_token}`);
+  } else if (!isPublishableKey(anonKey)) {
+    headers.set("Authorization", `Bearer ${anonKey}`);
+  }
   headers.set("Accept", "application/json");
   if (options.body !== undefined) headers.set("Content-Type", "application/json");
 
@@ -239,7 +251,9 @@ async function authRequest<T>(path: string, options: RequestInit = {}): Promise<
   const { url, anonKey } = getSupabaseConfig();
   const headers = new Headers(options.headers);
   headers.set("apikey", anonKey);
-  if (!headers.has("Authorization")) headers.set("Authorization", `Bearer ${anonKey}`);
+  if (!headers.has("Authorization") && !isPublishableKey(anonKey)) {
+    headers.set("Authorization", `Bearer ${anonKey}`);
+  }
   headers.set("Accept", "application/json");
   if (options.body !== undefined) headers.set("Content-Type", "application/json");
 
